@@ -5,19 +5,38 @@
 #include<assert.h>
 #include<thread>
 #include<mutex>
+#include<Windows.h>
+#include<new>
 using std::cout;
 using std::endl;
 
 static const size_t MAX_BYTES = 256 * 1024;//小于256KB，找threadcache分配
 static const size_t NFREELIST = 208;//threadcache/centralcache多少个桶/自由链表（MAX_BYTES和映射规则决定了的）
+static const size_t NPAGES = 128;//自己定的，一页8k的话，128页可以供给4个MAX_BYTES了
+static const size_t PAGE_SHIFT = 13;//用来除以8k来算几页
+
 
 #ifdef _WIN64
-	typedef unsigned long long PAGE_ID;
+typedef unsigned long long PAGE_ID;
 #elif _WIN32
-	typedef size_t PAGE_ID;
+typedef size_t PAGE_ID;
 #else 
-	//Linux
+//Linux
 #endif
+
+//去堆上按页申请空间
+static void* SystemAlloc(size_t kpage) {
+#ifdef _WIN32
+	void* ptr = VirtualAlloc(0, kpage << PAGE_SHIFT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else 
+	//Linux下brk mmap等
+#endif
+
+	if (ptr == nullptr) {
+		throw std::bad_alloc();
+	}
+	return ptr;
+}
 
 
 static void*& NextObj(void* obj) {
@@ -51,13 +70,13 @@ public:
 	}
 	//判空
 	bool Empty() {
-		return _freelist==nullptr;
+		return _freelist == nullptr;
 	}
 	size_t& MaxSize() {
 		return _maxSize;
 	}
 private:
-	void* _freelist=nullptr;
+	void* _freelist = nullptr;
 	size_t _maxSize = 1;
 };
 
@@ -75,7 +94,7 @@ public:
 	//计算内存对齐
 	static inline size_t _RoundUp(size_t size, size_t alignNum) {//传内存大小和对齐数
 		//其实就是找到与size最相近且大的alignNum的倍数
-		
+
 		//return (size+alignNum-1)&(alignNum-1);//位运算快
 
 		size_t alignSize = 0;//对齐后的内存大小
@@ -89,7 +108,7 @@ public:
 
 	}
 	static inline size_t RoundUp(size_t size) {
-		
+
 		if (size <= 128) {
 			return _RoundUp(size, 8);
 		}
@@ -150,11 +169,24 @@ public:
 		// 小对象一次批量上限高
 		// 大对象一次批量上限低
 		//【2，512】
-		int num = MAX_BYTES / size;
+		size_t num = MAX_BYTES / size;
 		if (num < 2) num = 2;
 		if (num > 512) num = 512;
 
 		return num;
+	}
+
+	//计算一次向PageCache获取几页
+	static size_t NumMovePage(size_t size) {
+		size_t num = NumMoveSize(size);//一共申请几个size的内存块
+		size_t npage = num * size;//一共多少字节
+
+		npage >>= PAGE_SHIFT;//计算多少页
+		if (npage = 0) {
+			npage = 1;
+		}
+
+		return npage;
 	}
 };
 
@@ -170,10 +202,10 @@ struct Span {
 	void* _freeList = nullptr; // 切好的小块内存的自由链表
 };
 
-// 带头双向循环链表
+// 带头双向循环链表。锁加这里
 class SpanList {
 public:
-	SpanList(){
+	SpanList() {
 		_head = new Span;
 		_head->_next = _head;
 		_head->_prev = _head;
@@ -200,8 +232,30 @@ public:
 		prev->_next = next;
 		next->_prev = prev;
 	}
+
+	void PushFront(Span* span) {
+		Insert(Begin(), span);
+	}
+	Span* PopFront() {
+		Span* front = _head->_next;
+		Erase(front);//解掉
+		return front;
+	}
+
+	Span* Begin() {
+		return _head->_next;
+	}
+	Span* End() {
+		return _head;
+	}
+
+	bool Empty() {
+		return _head->_next == _head;
+	}
+
+
 private:
 	Span* _head;
 public:
-	std::mutex _mtx; //加桶锁 
+	std::mutex _mtx; //桶锁 
 };
